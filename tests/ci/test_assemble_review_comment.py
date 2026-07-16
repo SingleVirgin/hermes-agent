@@ -5,11 +5,15 @@ classified by severity (error / action_required / warning / info), then
 renders them into a single PR comment body.
 
 Layout rules tested here:
+  - each item is its own ### section (no group headers)
   - errors + action_required always visible
   - warnings shown only when present
   - info in a collapsible <details> block
+  - sections separated by ---
+  - how_to_fix rendered at bottom of action_required items
   - empty → clean banner
   - sections omitted when their lane was skipped (None)
+  - review-label-gate excluded from failed jobs (already covered by action_required)
 """
 
 from __future__ import annotations
@@ -60,6 +64,14 @@ def test_failed_jobs_bad_json():
     assert _mod.collect_failed_jobs("not json", "https://run") == []
 
 
+def test_failed_jobs_excludes_review_label_gate():
+    """review-labels failure is action_required, not a real error."""
+    needs = json.dumps({"review-labels": "failure", "tests": "failure"})
+    items = _mod.collect_failed_jobs(needs, "https://run")
+    assert len(items) == 1
+    assert items[0].title == "tests"
+
+
 # ─── collect_lockfile ─────────────────────────────────────────────────
 
 
@@ -90,6 +102,7 @@ def test_lockfile_changed_no_content():
     assert len(items) == 1
     assert items[0].severity == "action_required"
     assert "diff content was unavailable" in items[0].summary
+    assert items[0].how_to_fix  # has a fix instruction
 
 
 # ─── collect_ci_review / collect_mcp_review ──────────────────────────
@@ -109,7 +122,9 @@ def test_ci_review_label_missing():
     items = _mod.collect_ci_review(False)
     assert len(items) == 1
     assert items[0].severity == "action_required"
-    assert "Add the `ci-reviewed` label" in items[0].summary
+    assert "ci-reviewed" in items[0].how_to_fix
+    # how_to_fix should NOT be in summary anymore
+    assert "Add the `ci-reviewed` label" not in items[0].summary
 
 
 def test_mcp_review_skipped():
@@ -126,7 +141,8 @@ def test_mcp_review_label_missing():
     items = _mod.collect_mcp_review(False)
     assert len(items) == 1
     assert items[0].severity == "action_required"
-    assert "Add the `ci-reviewed` label" in items[0].summary
+    assert "ci-reviewed" in items[0].how_to_fix
+    assert "Add the `ci-reviewed` label" not in items[0].summary
 
 
 # ─── collect_timings ─────────────────────────────────────────────────
@@ -175,13 +191,58 @@ def test_render_empty_shows_clean_banner():
     assert "###" not in body  # no section headers
 
 
+def test_render_each_item_is_own_section():
+    """No group headers — each item gets its own ### with its title."""
+    items = [
+        ReviewItem(severity="error", title="tests", summary="Job **tests** failed.", link="https://run"),
+        ReviewItem(severity="error", title="lint", summary="Job **lint** failed.", link="https://run"),
+    ]
+    body = _mod.render_comment(items)
+    # Two ### headers, one per item
+    assert body.count("### ") == 2
+    assert "### ❌ tests" in body
+    assert "### ❌ lint" in body
+    # No group header like "### ❌ Error"
+    assert "### ❌ Error" not in body
+
+
+def test_render_no_duplicated_severity_in_header_and_body():
+    """The ### header has emoji+title; the body has label+summary. No dup."""
+    items = [ReviewItem(severity="error", title="tests", summary="Job failed.", link="https://run")]
+    body = _mod.render_comment(items)
+    assert "### ❌ tests" in body
+    assert "**❌ Error** — Job failed." in body
+
+
+def test_render_how_to_fix_at_bottom():
+    items = [
+        ReviewItem(severity="action_required", title="CI review", summary="Need label.",
+                   how_to_fix="Add the `ci-reviewed` label."),
+    ]
+    body = _mod.render_comment(items)
+    assert "**How to fix:**" in body
+    assert "Add the `ci-reviewed` label." in body
+    # how_to_fix should be after the summary
+    assert body.index("Need label.") < body.index("How to fix")
+
+
+def test_render_sections_separated_by_hr():
+    items = [
+        ReviewItem(severity="error", title="tests", summary="failed."),
+        ReviewItem(severity="action_required", title="CI review", summary="need label."),
+    ]
+    body = _mod.render_comment(items)
+    # --- between sections (the main body join)
+    assert "\n\n---\n\n" in body
+
+
 def test_render_errors_always_visible():
     items = [
         ReviewItem(severity="error", title="tests", summary="Job **tests** failed.", link="https://run"),
         ReviewItem(severity="info", title="lockfile", summary="No changes."),
     ]
     body = _mod.render_comment(items)
-    assert "❌ Error" in body
+    assert "### ❌ tests" in body
     assert "Job **tests** failed." in body
     assert "[View logs](https://run)" in body
     # Info goes in collapsible section
@@ -194,22 +255,22 @@ def test_render_action_required_visible():
         ReviewItem(severity="action_required", title="CI review", summary="Add the label."),
     ]
     body = _mod.render_comment(items)
-    assert "⚠️ Action required" in body
+    assert "### ⚠️ CI review" in body
     assert "<details>" not in body  # no info items
 
 
-def test_render_warning_shown_only_if_present():
+def test_render_warning_as_own_section():
     items = [
-        ReviewItem(severity="warning", title="timings", summary="Slower."),
+        ReviewItem(severity="warning", title="CI timings", summary="Slower."),
     ]
     body = _mod.render_comment(items)
-    assert "⚠️ Warning" in body
+    assert "### ⚠️ CI timings" in body
     assert "<details>" not in body  # no info items
 
     # No warnings → no warning section
     items2 = [ReviewItem(severity="info", title="x", summary="y")]
     body2 = _mod.render_comment(items2)
-    assert "⚠️ Warning" not in body2
+    assert "⚠️ CI timings" not in body2
 
 
 def test_render_info_in_collapsible_details():
@@ -233,24 +294,11 @@ def test_render_order_errors_then_action_then_warn_then_info():
         ReviewItem(severity="error", title="e", summary="error"),
     ]
     body = _mod.render_comment(items)
-    error_pos = body.index("❌ Error")
-    action_pos = body.index("⚠️ Action required")
-    warn_pos = body.index("⚠️ Warning")
+    error_pos = body.index("### ❌ e")
+    action_pos = body.index("### ⚠️ a")
+    warn_pos = body.index("### ⚠️ w")
     info_pos = body.index("<details>")
     assert error_pos < action_pos < warn_pos < info_pos
-
-
-def test_render_multiple_errors_joined_with_divider():
-    items = [
-        ReviewItem(severity="error", title="tests", summary="tests failed."),
-        ReviewItem(severity="error", title="lint", summary="lint failed."),
-    ]
-    body = _mod.render_comment(items)
-    assert "tests failed." in body
-    assert "lint failed." in body
-    # Two errors in the same severity section, separated by ---
-    error_section = body[body.index("❌ Error"):]
-    assert error_section.index("---") < error_section.index("lint failed.")
 
 
 # ─── render_comment (pending jobs) ────────────────────────────────────
@@ -296,7 +344,7 @@ def test_assemble_pending_jobs():
 def test_assemble_with_items_and_pending():
     needs = json.dumps({"tests": "failure"})
     body = _mod.assemble(needs_json=needs, run_url="https://run", pending_jobs=["ci-timings"])
-    assert "❌ Error" in body
+    assert "### ❌ tests" in body
     assert "Still running" in body
     assert "`ci-timings`" in body
 
@@ -314,8 +362,7 @@ def test_assemble_all_skipped_clean_banner():
 def test_assemble_failed_job_shown():
     needs = json.dumps({"tests": "failure", "lint": "success"})
     body = _mod.assemble(needs_json=needs, run_url="https://run/1")
-    assert "❌ Error" in body
-    assert "tests" in body
+    assert "### ❌ tests" in body
     assert "https://run/1" in body
 
 
@@ -329,7 +376,7 @@ def test_assemble_action_required_and_info_mixed():
         mcp_catalog=None,
     )
     # ci_review=False → action_required
-    assert "⚠️ Action required" in body
+    assert "### ⚠️ CI-sensitive file review" in body
     # lockfile=False → info (in collapsible)
     assert "<details>" in body
     assert "No lockfile changes" in body
@@ -341,7 +388,6 @@ def test_assemble_ci_and_mcp_independent_gating():
     # CI-review: label present → info
     assert "`ci-reviewed` label is present" in body
     # MCP: label missing → action_required
-    assert "MCP catalog" in body
-    assert "⚠️ Action required" in body
+    assert "### ⚠️ MCP catalog security review" in body
     # Lockfile section not present
     assert "package-lock.json" not in body

@@ -65,6 +65,15 @@ _SEVERITY_LABEL = {
     "info": "ℹ️ Information",
 }
 
+# Emoji for the ### header (kept separate from the label so the body
+# line doesn't duplicate the emoji).
+_SEVERITY_EMOJI = {
+    "error": "❌",
+    "action_required": "⚠️",
+    "warning": "⚠️",
+    "info": "ℹ️",
+}
+
 
 @dataclass
 class ReviewItem:
@@ -76,6 +85,7 @@ class ReviewItem:
     detail: str = ""  # optional markdown detail (tables, bullet lists, etc.)
     link: str = ""  # optional URL (e.g. job logs, report)
     link_label: str = "View logs"  # label for the link
+    how_to_fix: str = ""  # optional markdown checklist for action_required items
 
 
 def _bool(val: str | None) -> bool | None:
@@ -95,12 +105,29 @@ def _bool(val: str | None) -> bool | None:
 # ---------------------------------------------------------------------------
 
 
+# Jobs whose failure is "action required" (a human needs to add a label
+# or take a step), not a real error. These are already covered by their
+# own action_required sections, so they should not also appear as ❌ Error
+# entries in the failed-jobs list.
+_ACTION_REQUIRED_JOBS = frozenset({
+    "review-labels",
+    "Review label gate",
+    "Review labels",
+    "ci-review",
+    "mcp-catalog-review",
+})
+
+
 def collect_failed_jobs(needs_json: str, run_url: str) -> list[ReviewItem]:
     """Build error items for failed CI jobs from the ``needs`` context.
 
     ``needs_json`` is the JSON string emitted by ``all-checks-pass`` — a
     ``{job_name: result}`` dict where result is ``success`` / ``failure``
     / ``skipped``. Only ``failure`` entries become error items.
+
+    Jobs in ``_ACTION_REQUIRED_JOBS`` are excluded — their failure means
+    "a label is missing", not "something broke". They're already covered
+    by the ci-review / mcp-catalog action_required sections.
 
     ``run_url`` is the URL to the CI run summary page, so the reviewer
     can click through to the actual logs.
@@ -115,6 +142,8 @@ def collect_failed_jobs(needs_json: str, run_url: str) -> list[ReviewItem]:
     items: list[ReviewItem] = []
     for name, result in sorted(needs.items()):
         if result != "failure":
+            continue
+        if name in _ACTION_REQUIRED_JOBS:
             continue
         items.append(ReviewItem(
             severity="error",
@@ -142,7 +171,8 @@ def collect_lockfile(
         return [ReviewItem(
             severity="action_required",
             title="package-lock.json",
-            summary="Lockfile changes detected but the diff content was unavailable (artifact expired or download failed). Inspect `package-lock.json` directly.",
+            summary="Lockfile changes detected but the diff content was unavailable (artifact expired or download failed).",
+            how_to_fix="Inspect `package-lock.json` directly in the PR diff.",
         )]
     return [ReviewItem(
         severity="info",
@@ -160,7 +190,7 @@ def collect_ci_review(reviewed: bool | None) -> list[ReviewItem]:
         return [ReviewItem(
             severity="info",
             title="CI-sensitive file review",
-            summary="`ci-reviewed` label is present. No action needed.",
+            summary="`ci-reviewed` label is present.",
         )]
     return [ReviewItem(
         severity="action_required",
@@ -168,9 +198,10 @@ def collect_ci_review(reviewed: bool | None) -> list[ReviewItem]:
         summary=(
             "This PR changes CI-sensitive files (eslint config, workflow YAMLs, "
             "or composite actions). These influence what the js-autofix job "
-            "executes and pushes to main. Add the `ci-reviewed` label after verifying:"
+            "executes and pushes to main."
         ),
-        detail=(
+        how_to_fix=(
+            "Add the `ci-reviewed` label after verifying:\n"
             "- no new eslint rules with custom `fix` functions that write outside linted paths,\n"
             "- no workflow changes that widen permissions or remove guards,\n"
             "- no composite action changes that alter what gets executed."
@@ -186,7 +217,7 @@ def collect_mcp_review(reviewed: bool | None) -> list[ReviewItem]:
         return [ReviewItem(
             severity="info",
             title="MCP catalog security review",
-            summary="`ci-reviewed` label is present. No action needed.",
+            summary="`ci-reviewed` label is present.",
         )]
     return [ReviewItem(
         severity="action_required",
@@ -194,10 +225,10 @@ def collect_mcp_review(reviewed: bool | None) -> list[ReviewItem]:
         summary=(
             "This PR changes the bundled MCP catalog or MCP catalog installer code. "
             "MCP entries can define local commands that users later install into "
-            "`mcp_servers`, so this needs explicit maintainer review before merge. "
-            "Add the `ci-reviewed` label after verifying:"
+            "`mcp_servers`, so this needs explicit maintainer review before merge."
         ),
-        detail=(
+        how_to_fix=(
+            "Add the `ci-reviewed` label after verifying:\n"
             "- any new/changed `optional-mcps/**/manifest.yaml` command and args are expected,\n"
             "- stdio transports do not use shell+egress/exfiltration payloads,\n"
             "- git install refs are pinned and bootstrap commands are minimal,\n"
@@ -240,34 +271,53 @@ def collect_timings(status_path: Path) -> list[ReviewItem]:
 
 
 def _render_item(item: ReviewItem) -> str:
-    """Render a single ReviewItem as a markdown block."""
-    parts = [f"**{_SEVERITY_LABEL[item.severity]}** — {item.summary}"]
+    """Render a single ReviewItem as a markdown ``###`` section.
+
+    Layout per item::
+
+        ### {title}
+
+        **{Severity label}** — {summary}
+
+        {detail}
+
+        [{link_label}]({link})
+
+        **How to fix:**
+
+        {how_to_fix}
+
+    The ``###`` header carries the emoji + title; the body line carries
+    the severity prefix + summary. No duplicated headers.
+    """
+    parts = [f"### {_SEVERITY_EMOJI[item.severity]} {item.title}", ""]
+    parts.append(f"**{_SEVERITY_LABEL[item.severity]}** — {item.summary}")
+
     if item.detail:
         parts.append("")
         parts.append(item.detail)
+
     if item.link:
         parts.append("")
         parts.append(f"[{item.link_label}]({item.link})")
+
+    if item.how_to_fix:
+        parts.append("")
+        parts.append("**How to fix:**")
+        parts.append("")
+        parts.append(item.how_to_fix)
+
     return "\n".join(parts)
-
-
-def _render_severity_group(
-    severity: str, items: list[ReviewItem]
-) -> str:
-    """Render all items of one severity as a ``###`` section."""
-    lines = [f"### {_SEVERITY_LABEL[severity]}", ""]
-    blocks = [_render_item(item) for item in items]
-    lines.append("\n---\n".join(blocks))
-    return "\n".join(lines)
 
 
 def render_comment(items: list[ReviewItem], pending_jobs: list[str] | None = None) -> str:
     """Render the full comment body from a list of review items.
 
-    Layout: errors + action_required always visible (each as a ``###``
-    section), warnings if present, info in a collapsible
-    ``<details>`` block. If ``pending_jobs`` is non-empty, a dimmed
-    footer is appended listing jobs still running.
+    Each item is its own ``###`` section, separated by ``---``. Errors
+    and action_required items are always visible. Warnings are shown
+    only when present. Info items are in a collapsible ``<details>``
+    block. If ``pending_jobs`` is non-empty, a dimmed ``<sub>`` footer
+    is appended listing jobs still running.
     """
     if not items and not pending_jobs:
         return (
@@ -292,22 +342,20 @@ def render_comment(items: list[ReviewItem], pending_jobs: list[str] | None = Non
 
     sections: list[str] = []
 
-    # Errors + action_required: always visible
+    # Errors + action_required: always visible, each as its own ### section
     for sev in ("error", "action_required"):
-        group = by_severity.get(sev, [])
-        if group:
-            sections.append(_render_severity_group(sev, group))
+        for item in by_severity.get(sev, []):
+            sections.append(_render_item(item))
 
-    # Warnings: only if present
-    warn = by_severity.get("warning", [])
-    if warn:
-        sections.append(_render_severity_group("warning", warn))
+    # Warnings: each as its own ### section, only if present
+    for item in by_severity.get("warning", []):
+        sections.append(_render_item(item))
 
-    # Info: collapsible
+    # Info: collapsible <details> section
     info = by_severity.get("info", [])
     if info:
         detail_blocks = [_render_item(item) for item in info]
-        detail_md = "\n---\n".join(detail_blocks)
+        detail_md = "\n\n---\n\n".join(detail_blocks)
         sections.append(
             "<details>\n"
             f"<summary>ℹ️ Details ({len(info)} item{'s' if len(info) != 1 else ''})</summary>\n\n"
@@ -315,7 +363,7 @@ def render_comment(items: list[ReviewItem], pending_jobs: list[str] | None = Non
             "</details>"
         )
 
-    body = f"{MARKER}\n## ૮ >ﻌ< ა CI review\n\n" + "\n\n".join(sections)
+    body = f"{MARKER}\n## ૮ >ﻌ< ა CI review\n\n" + "\n\n---\n\n".join(sections)
 
     # Pending jobs footer — dimmed so it doesn't compete with the real results.
     if pending_jobs:

@@ -181,16 +181,18 @@ def collect_run_jobs(token: str, repo: str, run_id: str) -> list[dict]:
     sub_runs = [r for r in sub_runs if r.get("created_at", "") >= created_at]
 
     all_jobs: list[dict] = []
-    # Orchestrator jobs: skip workflow-call placeholders
+    # Orchestrator jobs: skip workflow-call placeholder steps (they're
+    # sub-workflow triggers, not review signal), but KEEP in_progress /
+    # queued jobs so the poller knows they're still running.
     for job in orch_jobs:
         steps = job.get("steps") or []
         if any(s.get("name", "").startswith("Run ./.github/") for s in steps):
             continue
-        if job.get("status") in ("in_progress", "queued"):
-            continue  # skip self / unfinished orchestrator jobs
         all_jobs.append(job)
 
-    # Sub-workflow jobs
+    # Sub-workflow jobs (workflow_call).
+    # These runs may not exist yet on the first few polls — that's fine,
+    # classify_jobs() will just show 0 pending for them.
     for sr in sub_runs:
         sr_id = sr["id"]
         sr_name = sr.get("name", "")
@@ -407,8 +409,22 @@ def main() -> int:
             return 1
 
     lockfile_changed = _bool_env(os.environ.get("LOCKFILE_CHANGED"))
-    ci_review = _bool_env(os.environ.get("CI_REVIEW_LANE")) and _bool_env(os.environ.get("CI_REVIEW"))
-    mcp_catalog = _bool_env(os.environ.get("MCP_CATALOG_LANE")) and _bool_env(os.environ.get("CI_REVIEW"))
+
+    # Tri-state lane gating:
+    #   lane didn't run → None (section omitted)
+    #   lane ran, label missing → False (action_required)
+    #   lane ran, label present → True (info)
+    ci_review_lane = _bool_env(os.environ.get("CI_REVIEW_LANE"))
+    mcp_catalog_lane = _bool_env(os.environ.get("MCP_CATALOG_LANE"))
+    label_present = _bool_env(os.environ.get("CI_REVIEW"))
+
+    ci_review: bool | None = None
+    if ci_review_lane is True:
+        ci_review = label_present if label_present is not None else False
+
+    mcp_catalog: bool | None = None
+    if mcp_catalog_lane is True:
+        mcp_catalog = label_present if label_present is not None else False
 
     return run(
         token=token,
