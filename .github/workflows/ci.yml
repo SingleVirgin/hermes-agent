@@ -205,7 +205,7 @@ jobs:
 
   comment-results:
     name: CI review comment (results)
-    needs: [detect, lockfile-diff, review-labels]
+    needs: [detect, all-checks-pass, ci-timings]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -214,11 +214,19 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download lockfile diff artifact
-        if: needs.lockfile-diff.result == 'success'
+        if: needs.lockfile-diff.result == 'success' || needs.detect.outputs.npm_lock == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: lockfile-diff
           path: /tmp/artifacts/lockfile-diff
+        continue-on-error: true
+
+      - name: Download CI timings review status
+        if: needs.ci-timings.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-timings-report
+          path: /tmp/artifacts/ci-timings
         continue-on-error: true
 
       - name: Assemble and post comment
@@ -226,6 +234,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          NEEDS_JSON: ${{ needs.all-checks-pass.outputs.needs-json }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           LOCKFILE_CHANGED: ${{ needs.lockfile-diff.outputs.changed }}
           CI_REVIEW: ${{ needs.review-labels.outputs.ci_reviewed }}
           # detect outputs tell us *which lanes ran*, so the assemble script
@@ -247,6 +257,12 @@ jobs:
             LOCKFILE_DIFF_PATH="/tmp/lockfile-diff-fallback.md"
           fi
 
+          TIMINGS_STATUS_PATH="/tmp/artifacts/ci-timings/review-status.json"
+          if [ ! -f "$TIMINGS_STATUS_PATH" ]; then
+            : > /tmp/timings-status-fallback.json
+            TIMINGS_STATUS_PATH="/tmp/timings-status-fallback.json"
+          fi
+
           # Only pass the label status when the lane actually ran. If the
           # lane was skipped (detect output was false), pass empty so the
           # section is omitted entirely.
@@ -260,10 +276,13 @@ jobs:
           fi
 
           python3 scripts/ci/assemble_review_comment.py \
+            --needs-json "$NEEDS_JSON" \
+            --run-url "$RUN_URL" \
             --lockfile-changed "$LOCKFILE_CHANGED" \
             --lockfile-diff "$LOCKFILE_DIFF_PATH" \
             --ci-review "$CI_REVIEW_ARG" \
             --mcp-catalog "$MCP_CATALOG_ARG" \
+            --timings-status "$TIMINGS_STATUS_PATH" \
             --output /tmp/comment-body.md
 
           echo "Assembled comment body:"
@@ -296,6 +315,10 @@ jobs:
   # results cause it to fail; ``skipped`` is treated as success.
   #
   # Branch protection should require ONLY this check.
+  #
+  # Outputs ``needs-json`` — a compact ``{job_name: result}`` dict — so
+  # ``comment-results`` can list failed jobs in the PR comment without
+  # re-parsing the full ``needs`` context.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
@@ -314,19 +337,28 @@ jobs:
       - review-labels
       - osv-scanner
       - comment-pending
-      - comment-results
+      # comment-results depends on THIS job (needs its needs-json output),
+      # so it can't be a dependency — that would be circular.
       # we don't require docker to pass rn because it's so slow lol
       # - docker
     if: always()
     runs-on: ubuntu-latest
+    outputs:
+      needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
       - name: Evaluate job results
+        id: evaluate
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
+          # Emit compact {job_name: result} for the comment assembler.
+          compact = {name: info['result'] for name, info in needs.items()}
+          print(f'needs-json={json.dumps(compact)}')
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
           for name, info in sorted(needs.items()):
               result = info['result']
@@ -372,14 +404,17 @@ jobs:
             --baseline ci-timings-baseline.json \
             --output ci-timings-report.html \
             --json-out ci-timings.json \
-            --summary-out ci-timings-summary.md
+            --summary-out ci-timings-summary.md \
+            --review-status-out review-status.json
 
-      - name: Upload HTML report
+      - name: Upload HTML report + review status
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         id: ci-timings-artifact
         with:
           name: ci-timings-report
-          path: ci-timings-report.html
+          path: |
+            ci-timings-report.html
+            review-status.json
           retention-days: 14
           archive: false
 
