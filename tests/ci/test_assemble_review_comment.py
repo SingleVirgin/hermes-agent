@@ -253,6 +253,54 @@ def test_render_multiple_errors_joined_with_divider():
     assert error_section.index("---") < error_section.index("lint failed.")
 
 
+# ─── render_comment (pending jobs) ────────────────────────────────────
+
+
+def test_render_pending_only_shows_running_banner():
+    body = _mod.render_comment([], pending_jobs=["ci-timings"])
+    assert body.startswith(MARKER)
+    assert "⏳" in body
+    assert "`ci-timings`" in body
+    assert "###" not in body
+
+
+def test_render_pending_footer_appended_after_items():
+    items = [ReviewItem(severity="info", title="lockfile", summary="No changes.")]
+    body = _mod.render_comment(items, pending_jobs=["ci-timings"])
+    assert "૮ >ﻌ< ა" in body
+    # Items are above the pending footer
+    assert body.index("No changes.") < body.index("Still running")
+    assert "<sub>⏳ Still running: `ci-timings`</sub>" in body
+
+
+def test_render_pending_multiple_jobs_sorted():
+    body = _mod.render_comment([], pending_jobs=["docker", "ci-timings"])
+    assert "`ci-timings`" in body
+    assert "`docker`" in body
+    # sorted alphabetically
+    assert body.index("`ci-timings`") < body.index("`docker`")
+
+
+def test_render_no_pending_no_footer():
+    items = [ReviewItem(severity="info", title="x", summary="y")]
+    body = _mod.render_comment(items)
+    assert "Still running" not in body
+
+
+def test_assemble_pending_jobs():
+    body = _mod.assemble(pending_jobs=["ci-timings"])
+    assert "⏳" in body
+    assert "`ci-timings`" in body
+
+
+def test_assemble_with_items_and_pending():
+    needs = json.dumps({"tests": "failure"})
+    body = _mod.assemble(needs_json=needs, run_url="https://run", pending_jobs=["ci-timings"])
+    assert "❌ Error" in body
+    assert "Still running" in body
+    assert "`ci-timings`" in body
+
+
 # ─── assemble (integration) ──────────────────────────────────────────
 
 

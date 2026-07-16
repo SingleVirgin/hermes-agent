@@ -261,18 +261,28 @@ def _render_severity_group(
     return "\n".join(lines)
 
 
-def render_comment(items: list[ReviewItem]) -> str:
+def render_comment(items: list[ReviewItem], pending_jobs: list[str] | None = None) -> str:
     """Render the full comment body from a list of review items.
 
     Layout: errors + action_required always visible (each as a ``###``
     section), warnings if present, info in a collapsible
-    ``<details>`` block.
+    ``<details>`` block. If ``pending_jobs`` is non-empty, a dimmed
+    footer is appended listing jobs still running.
     """
-    if not items:
+    if not items and not pending_jobs:
         return (
             f"{MARKER}\n"
             "## ✅ CI review\n\n"
             "All checks passed — no issues to report.\n"
+        )
+
+    # If we only have pending jobs (no items yet), show a "running" banner.
+    if not items and pending_jobs:
+        job_list = ", ".join(f"`{j}`" for j in sorted(pending_jobs))
+        return (
+            f"{MARKER}\n"
+            "## ⏳ CI review\n\n"
+            f"CI checks are running. Waiting on: {job_list}.\n"
         )
 
     # Group by severity
@@ -305,7 +315,16 @@ def render_comment(items: list[ReviewItem]) -> str:
             "</details>"
         )
 
-    body = f"{MARKER}\n## ૮ >ﻌ< ა CI review\n\n" + "\n\n".join(sections) + "\n"
+    body = f"{MARKER}\n## ૮ >ﻌ< ა CI review\n\n" + "\n\n".join(sections)
+
+    # Pending jobs footer — dimmed so it doesn't compete with the real results.
+    if pending_jobs:
+        job_list = ", ".join(f"`{j}`" for j in sorted(pending_jobs))
+        body += (
+            f"\n\n---\n\n"
+            f"<sub>⏳ Still running: {job_list}</sub>\n"
+        )
+
     return body
 
 
@@ -322,6 +341,7 @@ def assemble(
     ci_review: bool | None = None,
     mcp_catalog: bool | None = None,
     timings_status: Path = Path("/dev/null"),
+    pending_jobs: list[str] | None = None,
 ) -> str:
     """Assemble the full comment body from all available inputs."""
     items: list[ReviewItem] = []
@@ -332,7 +352,7 @@ def assemble(
     items.extend(collect_mcp_review(mcp_catalog))
     items.extend(collect_timings(timings_status))
 
-    return render_comment(items)
+    return render_comment(items, pending_jobs)
 
 
 # ---------------------------------------------------------------------------
@@ -380,12 +400,19 @@ def main() -> int:
         help="Path to the CI timings review-status JSON file.",
     )
     parser.add_argument(
+        "--pending-jobs",
+        default="",
+        help="Comma-separated list of job names still running (shown in a dimmed footer).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         required=True,
         help="Output file for the assembled comment body.",
     )
     args = parser.parse_args()
+
+    pending = [j.strip() for j in args.pending_jobs.split(",") if j.strip()] if args.pending_jobs else None
 
     body = assemble(
         needs_json=args.needs_json,
@@ -395,6 +422,7 @@ def main() -> int:
         ci_review=_bool(args.ci_review),
         mcp_catalog=_bool(args.mcp_catalog),
         timings_status=args.timings_status,
+        pending_jobs=pending,
     )
 
     args.output.write_text(body)

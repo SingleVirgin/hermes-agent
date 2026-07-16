@@ -205,7 +205,7 @@ jobs:
 
   comment-results:
     name: CI review comment (results)
-    needs: [detect, all-checks-pass, ci-timings]
+    needs: [detect, all-checks-pass]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -219,14 +219,6 @@ jobs:
         with:
           name: lockfile-diff
           path: /tmp/artifacts/lockfile-diff
-        continue-on-error: true
-
-      - name: Download CI timings review status
-        if: needs.ci-timings.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: ci-timings-report
-          path: /tmp/artifacts/ci-timings
         continue-on-error: true
 
       - name: Assemble and post comment
@@ -245,6 +237,9 @@ jobs:
           # gate job is shared: ci-reviewed covers both).
           CI_REVIEW_LANE: ${{ needs.detect.outputs.ci_review }}
           MCP_CATALOG_LANE: ${{ needs.detect.outputs.mcp_catalog }}
+          # ci-timings and docker are NOT deps of all-checks-pass — they're
+          # still running when this job fires. The comment is posted now with
+          # a "still running" footer, and ci-timings updates it when done.
         run: |
           set -uo pipefail
 
@@ -255,12 +250,6 @@ jobs:
           if [ ! -f "$LOCKFILE_DIFF_PATH" ]; then
             : > /tmp/lockfile-diff-fallback.md
             LOCKFILE_DIFF_PATH="/tmp/lockfile-diff-fallback.md"
-          fi
-
-          TIMINGS_STATUS_PATH="/tmp/artifacts/ci-timings/review-status.json"
-          if [ ! -f "$TIMINGS_STATUS_PATH" ]; then
-            : > /tmp/timings-status-fallback.json
-            TIMINGS_STATUS_PATH="/tmp/timings-status-fallback.json"
           fi
 
           # Only pass the label status when the lane actually ran. If the
@@ -275,6 +264,10 @@ jobs:
             MCP_CATALOG_ARG="$CI_REVIEW"
           fi
 
+          # ci-timings runs after all-checks-pass, so it's still pending.
+          # Show it in the "still running" footer.
+          PENDING_JOBS="ci-timings"
+
           python3 scripts/ci/assemble_review_comment.py \
             --needs-json "$NEEDS_JSON" \
             --run-url "$RUN_URL" \
@@ -282,7 +275,7 @@ jobs:
             --lockfile-diff "$LOCKFILE_DIFF_PATH" \
             --ci-review "$CI_REVIEW_ARG" \
             --mcp-catalog "$MCP_CATALOG_ARG" \
-            --timings-status "$TIMINGS_STATUS_PATH" \
+            --pending-jobs "$PENDING_JOBS" \
             --output /tmp/comment-body.md
 
           echo "Assembled comment body:"
@@ -375,10 +368,14 @@ jobs:
   # cache them on main (as a baseline), and on PRs generate an HTML diff
   # report with a gantt chart + per-step breakdown. The report is uploaded
   # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
+  #
+  # On PRs, this job also re-assembles and updates the unified review
+  # comment (originally posted by ``comment-results``) to replace the
+  # "⏳ still running: ci-timings" footer with the actual timings result.
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
+    needs: [detect, all-checks-pass, docker, lockfile-diff, review-labels]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -416,7 +413,6 @@ jobs:
             ci-timings-report.html
             review-status.json
           retention-days: 14
-          archive: false
 
       - name: Output summary
         env:
@@ -425,6 +421,73 @@ jobs:
           echo "# CI Timing report" >> "$GITHUB_STEP_SUMMARY"
           echo "[View the full interactive report]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
           cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download lockfile diff artifact
+        if: github.event_name == 'pull_request' && (needs.lockfile-diff.result == 'success' || needs.detect.outputs.npm_lock == 'true')
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lockfile-diff
+          path: /tmp/artifacts/lockfile-diff
+        continue-on-error: true
+
+      - name: Update PR review comment with timings
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NEEDS_JSON: ${{ needs.all-checks-pass.outputs.needs-json }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LOCKFILE_CHANGED: ${{ needs.lockfile-diff.outputs.changed }}
+          CI_REVIEW: ${{ needs.review-labels.outputs.ci_reviewed }}
+          CI_REVIEW_LANE: ${{ needs.detect.outputs.ci_review }}
+          MCP_CATALOG_LANE: ${{ needs.detect.outputs.mcp_catalog }}
+        run: |
+          set -uo pipefail
+
+          LOCKFILE_DIFF_PATH="/tmp/artifacts/lockfile-diff/lockfile-diff.md"
+          if [ ! -f "$LOCKFILE_DIFF_PATH" ]; then
+            : > /tmp/lockfile-diff-fallback.md
+            LOCKFILE_DIFF_PATH="/tmp/lockfile-diff-fallback.md"
+          fi
+
+          CI_REVIEW_ARG=""
+          if [ "$CI_REVIEW_LANE" = "true" ]; then
+            CI_REVIEW_ARG="$CI_REVIEW"
+          fi
+          MCP_CATALOG_ARG=""
+          if [ "$MCP_CATALOG_LANE" = "true" ]; then
+            MCP_CATALOG_ARG="$CI_REVIEW"
+          fi
+
+          # Re-assemble the comment with the timings status now available.
+          # No --pending-jobs → the "still running" footer is dropped.
+          python3 scripts/ci/assemble_review_comment.py \
+            --needs-json "$NEEDS_JSON" \
+            --run-url "$RUN_URL" \
+            --lockfile-changed "$LOCKFILE_CHANGED" \
+            --lockfile-diff "$LOCKFILE_DIFF_PATH" \
+            --ci-review "$CI_REVIEW_ARG" \
+            --mcp-catalog "$MCP_CATALOG_ARG" \
+            --timings-status review-status.json \
+            --output /tmp/comment-body-final.md
+
+          MARKER='<!-- hermes-ci-review-bot -->'
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" \
+            | head -1 || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing comment ${EXISTING}"
+            gh api --method PATCH "repos/${REPO}/issues/comments/${EXISTING}" \
+              -F body=@/tmp/comment-body-final.md > /dev/null \
+              || echo "::warning::Could not update PR comment with timings (will retry next run)"
+          else
+            echo "No existing comment found — creating new"
+            gh api "repos/${REPO}/issues/${PR}/comments" \
+              -F body=@/tmp/comment-body-final.md > /dev/null \
+              || echo "::warning::Could not post PR comment with timings (will retry next run)"
+          fi
 
       - name: Save baseline cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
